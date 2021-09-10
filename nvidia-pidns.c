@@ -1,6 +1,7 @@
-#include <linux/module.h>
-#include <linux/fs_context.h>
 #include <linux/fs.h>
+#include <linux/fs_context.h>
+#include <linux/module.h>
+#include <linux/mount.h>
 #include <linux/pseudo_fs.h>
 
 #define NVIDIA_CTL_RDEV (MKDEV(195, 255))
