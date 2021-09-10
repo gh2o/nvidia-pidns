@@ -4,6 +4,7 @@
 #include <linux/pseudo_fs.h>
 
 #define NVIDIA_CTL_RDEV (MKDEV(195, 255))
+#define MAX_PID_COUNT (4096)
 
 #ifndef __amd64__
 #error only amd64 supported
@@ -29,6 +30,7 @@ typedef int (*nvidia_fixer_t)(struct nvidia_pidns_call *, enum nvidia_fixer_stat
 
 struct nvidia_pidns_call {
 	nvidia_fixer_t fixer;
+	void *priv;
 	void __user *data;
 };
 
@@ -50,12 +52,140 @@ static struct file_system_type dummy_fs_type = {
 
 static int fixer_0x0ee4(struct nvidia_pidns_call *call, enum nvidia_fixer_state st)
 {
-	return 0;
+	u32 pid_count;
+	u32 *pid_items = NULL;
+
+	u32 wr, rd, i;
+	int ret = 0;
+
+	switch (st) {
+		case NVIDIA_FIXER_INIT:
+			rcu_read_lock();
+			break;
+		case NVIDIA_FIXER_ERROR:
+			rcu_read_unlock();
+			break;
+		case NVIDIA_FIXER_SUCCESS:
+			if (copy_from_user(&pid_count, call->data + 8, sizeof(u32))) {
+				ret = -EFAULT;
+				goto out;
+			}
+			if (pid_count > MAX_PID_COUNT) {
+				ret = -EOVERFLOW;
+				goto out;
+			}
+
+			pid_items = kmalloc(pid_count * sizeof(u32), GFP_KERNEL);
+			if (!pid_items) {
+				ret = -ENOMEM;
+				goto out;
+			}
+
+			if (copy_from_user(pid_items, call->data + 12, pid_count * sizeof(u32))) {
+				ret = -EFAULT;
+				goto out;
+			}
+
+			/* translate PIDs to current namespace */
+			for (wr = rd = 0; rd < pid_count; rd++) {
+				struct pid *pid = find_pid_ns(pid_items[rd], &init_pid_ns);
+				u32 vpid = pid ? pid_vnr(pid) : 0;
+				if (vpid)
+					pid_items[wr++] = vpid;
+			}
+
+			/* clear entries after end */
+			for (i = wr; i < pid_count; i++)
+				pid_items[i] = 0;
+
+			/* copy results back to userspace */
+			if (copy_to_user(call->data + 8, &wr, sizeof(u32))) {
+				ret = -EFAULT;
+				goto out;
+			}
+			if (copy_to_user(call->data + 12, pid_items, pid_count * sizeof(u32))) {
+				ret = -EFAULT;
+				goto out;
+			}
+
+out:
+			rcu_read_unlock();
+			kfree(pid_items);
+			break;
+		default:
+			BUG();
+			break;
+	}
+
+	return ret;
 }
 
 static int fixer_0x2588(struct nvidia_pidns_call *call, enum nvidia_fixer_state st)
 {
-	return 0;
+	u32 pid_count;
+	u32 *orig_pids = (st == NVIDIA_FIXER_INIT) ? NULL : call->priv;
+
+	u32 i;
+	int ret = 0;
+
+	if (copy_from_user(&pid_count, call->data, sizeof(u32))) {
+		ret = -EFAULT;
+		goto out;
+	}
+	if (pid_count > MAX_PID_COUNT) {
+		ret = -EOVERFLOW;
+		goto out;
+	}
+
+	switch (st) {
+		case NVIDIA_FIXER_INIT:
+			/* save original PIDs */
+			orig_pids = kmalloc(pid_count * sizeof(u32), GFP_KERNEL);
+			if (!orig_pids) {
+				ret = -ENOMEM;
+				goto out;
+			}
+			for (i = 0; i < pid_count; i++) {
+				if (copy_from_user(&orig_pids[i], call->data + 0x8 + 0x30 * i, sizeof(u32))) {
+					ret = -EFAULT;
+					goto out;
+				}
+			}
+
+			/* translate the PIDs */
+			rcu_read_lock();
+			for (i = 0; i < pid_count; i++) {
+				struct pid *pid = find_vpid(orig_pids[i]);
+				u32 ipid = pid ? pid_nr(pid) : 0;
+				if (copy_to_user(call->data + 0x8 + 0x30 * i, &ipid, sizeof(u32))) {
+					ret = -EFAULT;
+					break; /* check ret after leaving loop */
+				}
+			}
+			rcu_read_unlock();
+
+			if (ret)
+				goto out;
+
+			/* save original PIDs into priv */
+			call->priv = orig_pids;
+			orig_pids = NULL;
+			break;
+		case NVIDIA_FIXER_ERROR:
+		case NVIDIA_FIXER_SUCCESS:
+			/* restore original PIDs */
+			for (i = 0; i < pid_count; i++) {
+				if (copy_to_user(call->data + 0x8 + 0x30 * i, &orig_pids[i], sizeof(u32))) {
+					ret = -EFAULT;
+					break;
+				}
+			}
+			break;
+	}
+
+out:
+	kfree(orig_pids);
+	return ret;
 }
 
 static long fix_before_call(struct nvidia_pidns_call *call, struct file *f, unsigned int cmd, unsigned long ularg)
@@ -90,10 +220,11 @@ static long fix_before_call(struct nvidia_pidns_call *call, struct file *f, unsi
 #undef VERSIONED_CMD
 
 	call->data = arg.data;
+	call->priv = NULL;
 	return call->fixer(call, NVIDIA_FIXER_INIT);
 }
 
-static long fix_after_call(struct nvidia_pidns_call *call, struct file *f, unsigned int cmd, unsigned long ularg, long ret)
+static long fix_after_call(struct nvidia_pidns_call *call, long ret)
 {
 	if (call->fixer) {
 		if (ret == 0)
@@ -112,7 +243,7 @@ static long nvidia_pidns_unlocked_ioctl(struct file *f, unsigned int cmd, unsign
 	ret = fix_before_call(&call, f, cmd, arg);
 	if (ret == 0) {
 		ret = nvidia_orig_unlocked_ioctl(f, cmd, arg);
-		ret = fix_after_call(&call, f, cmd, arg, ret);
+		ret = fix_after_call(&call, ret);
 	}
 
 	return ret;
@@ -126,7 +257,7 @@ static long nvidia_pidns_compat_ioctl(struct file *f, unsigned int cmd, unsigned
 	ret = fix_before_call(&call, f, cmd, arg);
 	if (ret == 0) {
 		ret = nvidia_orig_compat_ioctl(f, cmd, arg);
-		ret = fix_after_call(&call, f, cmd, arg, ret);
+		ret = fix_after_call(&call, ret);
 	}
 
 	return ret;
